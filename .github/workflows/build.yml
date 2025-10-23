@@ -1,39 +1,74 @@
-name: SonarCloud Scan
-
+name: SonarQube
 on:
   push:
-    branches: [ main ]
+    branches:
+      - main
   pull_request:
+    types: [opened, synchronize, reopened]
 
 jobs:
-  sonarcloud:
-    name: SonarCloud
-    runs-on: ubuntu-latest
-
+  build:
+    name: Build and Analyze (MSVC)
+    runs-on: windows-latest
+    env:
+      BUILD_WRAPPER_OUT_DIR: build_wrapper_output_directory
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # 保留完整历史利于某些度量（如新代码检测）
+          fetch-depth: 0
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
 
-      - name: Install dependencies
-        run: npm ci
+      - name: Install Build Wrapper
+        uses: SonarSource/sonarqube-scan-action/install-build-wrapper@v6
 
-      - name: Run tests with coverage
-        run: npm test -- --coverage
-        # 确保测试框架生成 lcov.info；Jest 默认在 coverage/lcov.info
+      - name: Clean & Build (wrapped)
+        run: |
+          build-wrapper-win-x86-64.exe --out-dir ${{ env.BUILD_WRAPPER_OUT_DIR }} msbuild YourSolution.sln /t:Rebuild /p:Configuration=Debug /m
 
-      - name: SonarCloud Scan
-        uses: SonarSource/sonarcloud-github-action@v2
+      # (可选) 运行测试并生成覆盖率
+      # - name: Run Tests
+      #   run: |
+      #     VSTest.Console.exe path\to\testdlls  # 或者使用自定义测试运行器
+      # - name: Generate Coverage (示例 OpenCppCoverage)
+      #   run: |
+      #     OpenCppCoverage --cover_children --export_type=cobertura --output coverage.xml --target ".\build\Debug\tests\MyTests.exe"
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@v6
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
         with:
           args: >
-            -Dsonar.projectKey=joe98107_my-project
-            -Dsonar.organization=joe98107
-            -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info
+            --define "sonar.projectKey=your-cpp-project"
+            --define "sonar.host.url=${{ secrets.SONAR_HOST_URL }}"
+            --define "sonar.sources=src,include"
+            --define "sonar.tests=tests"
+            --define "sonar.exclusions=**/build/**,**/third_party/**"
+            --define "sonar.sourceEncoding=UTF-8"
+            --define "sonar.cfamily.build-wrapper-output=${{ env.BUILD_WRAPPER_OUT_DIR }}"
+            # 如果已经生成 coverage.xml:
+            # --define "sonar.coverageReportPaths=coverage.xml"
+
+      - name: Quality Gate (Optional Poll)
+        if: github.event_name == 'push'
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        run: |
+          for /l %%i in (1,1,30) do (
+            powershell -Command "
+              \$r = Invoke-RestMethod -Headers @{Authorization='Basic '+[Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes('${{ env.SONAR_TOKEN }}:'))} -Uri '${{ env.SONAR_HOST_URL }}/api/qualitygates/project_status?projectKey=your-cpp-project';
+              \$status = \$r.projectStatus.status;
+              Write-Host 'Quality Gate Status:' \$status;
+              if (\$status -ne 'IN_PROGRESS' -and \$status -ne 'NONE') {
+                if (\$status -ne 'OK') { exit 1 } else { exit 0 }
+              }
+            "
+            if !errorlevel! EQU 0 exit /b 0
+            timeout /t 5 > nul
+          )
+          exit /b 1
